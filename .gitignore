@@ -1,17 +1,38 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
+# Environment & secrets (NEVER commit real credentials or sessions)
+.env
+.env.*
 !.env.example
 *.session
 *.session-journal
+
+# Python virtual environments & caches
 .venv/
+venv/
 __pycache__/
-data/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local runtime data, SQLite databases, backups, exports, and logs
+data/database/*
+!data/database/.gitkeep
+data/backups/*
+!data/backups/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+data/logs/*
+!data/logs/.gitkeep
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+
+# OS & host preview artifacts
+.DS_Store
+node_modules/
 .playwright-cli/

@@ -1,393 +1,165 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import {
-  buildFtsQuery,
-  buildIndexableNormalizedText,
-  normalizePersianText,
-} from './src/core/normalization';
-import { SearchMode, SyncPolicy } from './src/core/types';
-import { ArchiveEngine } from './src/server/archiveEngine';
+
+const execFileAsync = promisify(execFile);
+const ROOT_DIR = process.cwd();
+
+const DOC_FILES: Record<string, string> = {
+  readme: 'README.md',
+  architecture: 'docs/ARCHITECTURE.md',
+  database: 'docs/DATABASE.md',
+  development: 'docs/DEVELOPMENT.md',
+};
+
+function resolveUvBinary(): string {
+  const candidates = ['/usr/local/bin/uv', path.join(process.env.HOME || '', '.local/bin/uv'), 'uv'];
+  for (const candidate of candidates) {
+    if (candidate === 'uv' || fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return 'uv';
+}
+
+async function runCommandCapture(
+  cmd: string,
+  args: string[],
+  timeoutMs = 30000
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, {
+      cwd: ROOT_DIR,
+      timeout: timeoutMs,
+      env: { ...process.env },
+    });
+    return { exitCode: 0, stdout, stderr };
+  } catch (err) {
+    const execErr = err as { code?: number; stdout?: string; stderr?: string; message?: string };
+    return {
+      exitCode: typeof execErr.code === 'number' ? execErr.code : 1,
+      stdout: execErr.stdout || '',
+      stderr: execErr.stderr || execErr.message || '',
+    };
+  }
+}
+
+async function inspectPythonHealth() {
+  const uvBin = resolveUvBinary();
+  const snippet = [
+    'import json, platform, sys',
+    'from pathlib import Path',
+    'from app.core.config import load_config',
+    'from app.database.sqlite import SQLiteDatabase',
+    'cfg = load_config()',
+    'db_exists = cfg.database_path.is_file()',
+    'health = SQLiteDatabase(cfg.database_path).health_check() if db_exists else {',
+    '  "healthy": False,',
+    '  "database_path": str(cfg.database_path),',
+    '  "sqlite_version": None,',
+    '  "foreign_keys_enabled": False,',
+    '  "tables": [],',
+    '  "missing_tables": ["chats", "messages", "schema_migrations", "sync_state", "users"],',
+    '  "applied_migrations": []',
+    '}',
+    'print(json.dumps({',
+    '  "python_version": platform.python_version(),',
+    '  "app_env": cfg.app_env,',
+    '  "log_level": cfg.app_log_level,',
+    '  "database_exists": db_exists,',
+    '  "health": health',
+    '}))',
+  ].join('\n');
+
+  const res = await runCommandCapture(uvBin, ['run', '--no-sync', 'python', '-c', snippet], 15000);
+  if (res.exitCode === 0 && res.stdout.trim()) {
+    try {
+      return JSON.parse(res.stdout.trim());
+    } catch {
+      // Fall through to fallback status
+    }
+  }
+  return {
+    python_version: '3.13 (pending uv sync)',
+    app_env: 'development',
+    log_level: 'INFO',
+    database_exists: fs.existsSync(path.join(ROOT_DIR, 'data/database/telegram_archive.db')),
+    health: {
+      healthy: false,
+      database_path: 'data/database/telegram_archive.db',
+      sqlite_version: null,
+      foreign_keys_enabled: false,
+      tables: [],
+      missing_tables: ['chats', 'messages', 'schema_migrations', 'sync_state', 'users'],
+      applied_migrations: [],
+    },
+  };
+}
 
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
 
-  app.use(express.json({ limit: '25mb' }));
+  app.use(express.json());
 
-  const engine = new ArchiveEngine();
-
-  // --- Health & System Overview ---
-  app.get('/api/overview', (_req, res) => {
+  app.get('/api/foundation/status', async (_req, res) => {
     try {
-      res.json({
-        stats: engine.getStats(),
-        chats: engine.listChats(),
-        tags: engine.listTags(),
-        users: engine.listUsers(),
-        settings: engine.getAllSettings(),
-        integrity: engine.checkIntegrity(),
-      });
-    } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
-    }
-  });
+      const schemaSql = fs.readFileSync(
+        path.join(ROOT_DIR, 'app/database/migrations/001_initial_schema.sql'),
+        'utf-8'
+      );
+      const pyprojectToml = fs.readFileSync(path.join(ROOT_DIR, 'pyproject.toml'), 'utf-8');
+      const pythonVersionPin = fs
+        .readFileSync(path.join(ROOT_DIR, '.python-version'), 'utf-8')
+        .trim();
+      const pythonStatus = await inspectPythonHealth();
 
-  // --- Search Messages (SQLite FTS5 + Persian Normalizer) ---
-  app.get('/api/search', (req, res) => {
-    try {
-      const q = typeof req.query.q === 'string' ? req.query.q : '';
-      const mode =
-        req.query.mode === SearchMode.EXACT ? SearchMode.EXACT : SearchMode.FLEXIBLE;
-      const chatId = req.query.chatId ? Number(req.query.chatId) : undefined;
-      const senderId = req.query.senderId ? Number(req.query.senderId) : undefined;
-      const dateFrom = typeof req.query.dateFrom === 'string' ? req.query.dateFrom : undefined;
-      const dateTo = typeof req.query.dateTo === 'string' ? req.query.dateTo : undefined;
-      const tag = typeof req.query.tag === 'string' ? req.query.tag : undefined;
-      const onlyImportant = req.query.onlyImportant === 'true';
-      const hasLink = req.query.hasLink === 'true';
-      const page = req.query.page ? Number(req.query.page) : 1;
-      const pageSize = req.query.pageSize ? Number(req.query.pageSize) : 15;
-
-      const result = engine.searchMessages({
-        q,
-        mode,
-        chatId,
-        senderId,
-        dateFrom,
-        dateTo,
-        tag,
-        onlyImportant,
-        hasLink,
-        page,
-        pageSize,
-      });
-      res.json(result);
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  // --- Message Detail & Reply Chain ---
-  app.get('/api/messages/:chatId/:messageId', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const messageId = Number(req.params.messageId);
-      const detail = engine.getMessageDetail(chatId, messageId);
-      if (!detail) {
-        res.status(404).json({ error: 'پیام یافت نشد.' });
-        return;
+      const docs: Record<string, string> = {};
+      for (const [key, relPath] of Object.entries(DOC_FILES)) {
+        const fullPath = path.join(ROOT_DIR, relPath);
+        docs[key] = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : '';
       }
-      res.json(detail);
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
 
-  // --- Knowledge Actions: Important, Tags, Personal Notes, Manual Sync ---
-  app.post('/api/messages/:chatId/:messageId/important', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const messageId = Number(req.params.messageId);
-      const isImportant = Boolean(req.body?.isImportant);
-      const message = engine.toggleImportant(chatId, messageId, isImportant);
-      res.json({ message, stats: engine.getStats() });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.post('/api/messages/:chatId/:messageId/tags', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const messageId = Number(req.params.messageId);
-      const tag = String(req.body?.tag || '');
-      const message = engine.addTagToMessage(chatId, messageId, tag);
-      res.json({ message, tags: engine.listTags() });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.delete('/api/messages/:chatId/:messageId/tags/:tagName', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const messageId = Number(req.params.messageId);
-      const tagName = decodeURIComponent(req.params.tagName);
-      const message = engine.removeTagFromMessage(chatId, messageId, tagName);
-      res.json({ message, tags: engine.listTags() });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.put('/api/messages/:chatId/:messageId/note', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const messageId = Number(req.params.messageId);
-      const noteText = String(req.body?.noteText ?? '');
-      const message = engine.savePersonalNote(chatId, messageId, noteText);
-      res.json({ message });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.post('/api/messages/:chatId/:messageId/queue-sync', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const messageId = Number(req.params.messageId);
-      const message = engine.enqueueManualSync(chatId, messageId);
-      res.json({ message, stats: engine.getStats() });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  // --- Chats, Sync Policies & Checkpoint Import ---
-  app.get('/api/chats', (_req, res) => {
-    res.json({ chats: engine.listChats() });
-  });
-
-  app.patch('/api/chats/:chatId', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const result = engine.updateChatConfig(chatId, {
-        isActive: req.body?.isActive,
-        syncPolicy: req.body?.syncPolicy,
-        customRule: req.body?.customRule,
-      });
       res.json({
-        ...result,
-        chats: engine.listChats(),
-        stats: engine.getStats(),
-      });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.post('/api/chats/:chatId/import-batch', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const batchSize = Number(req.body?.batchSize || 2);
-      const result = engine.runCheckpointImportBatch(chatId, batchSize);
-      res.json({
-        ...result,
-        chats: engine.listChats(),
-        stats: engine.getStats(),
-      });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.post('/api/chats/:chatId/import-pause', (req, res) => {
-    try {
-      const chatId = Number(req.params.chatId);
-      const paused = Boolean(req.body?.paused);
-      const chat = engine.setImportPauseState(chatId, paused);
-      res.json({ chat, chats: engine.listChats() });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.post('/api/import/telegram-json', (req, res) => {
-    try {
-      const rawJson = String(req.body?.rawJson || '');
-      const syncPolicy = (req.body?.syncPolicy as SyncPolicy) || SyncPolicy.LOCAL_ONLY;
-      if (!rawJson.trim()) {
-        res.status(400).json({ error: 'محتوای فایل JSON خالی است.' });
-        return;
-      }
-      const result = engine.importTelegramJsonExport(rawJson, syncPolicy);
-      res.json({
-        ...result,
-        chats: engine.listChats(),
-        stats: engine.getStats(),
-        tags: engine.listTags(),
-        users: engine.listUsers(),
-      });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  // --- Knowledge Repository: Links & Exports ---
-  app.get('/api/knowledge/links', (_req, res) => {
-    res.json({ links: engine.listLinks(150) });
-  });
-
-  app.get('/api/export/json', (req, res) => {
-    const onlyImportant = req.query.onlyImportant === 'true';
-    const chatId = req.query.chatId ? Number(req.query.chatId) : undefined;
-    const tag = typeof req.query.tag === 'string' ? req.query.tag : undefined;
-    const data = engine.searchMessages({
-      onlyImportant,
-      chatId,
-      tag,
-      page: 1,
-      pageSize: 1000,
-    });
-
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader(
-      'Content-Disposition',
-      'attachment; filename="telegram-knowledge-archive.json"'
-    );
-    res.send(
-      JSON.stringify(
-        {
-          exportedAt: new Date().toISOString(),
-          format: 'telegram-knowledge-engine-v1',
-          mediaIncluded: false,
-          count: data.items.length,
-          messages: data.items,
-        },
-        null,
-        2
-      )
-    );
-  });
-
-  app.get('/api/export/csv', (req, res) => {
-    const onlyImportant = req.query.onlyImportant === 'true';
-    const chatId = req.query.chatId ? Number(req.query.chatId) : undefined;
-    const tag = typeof req.query.tag === 'string' ? req.query.tag : undefined;
-    const csv = engine.exportMessagesCsv({ onlyImportant, chatId, tag });
-
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader(
-      'Content-Disposition',
-      'attachment; filename="telegram-knowledge-archive.csv"'
-    );
-    res.send(csv);
-  });
-
-  // --- Cloud Sync Outbox Engine ---
-  app.get('/api/sync/outbox', (req, res) => {
-    const status = typeof req.query.status === 'string' ? req.query.status : 'ALL';
-    res.json({
-      outbox: engine.listOutbox(status),
-      history: engine.listSyncHistory(),
-      stats: engine.getStats(),
-    });
-  });
-
-  app.post('/api/sync/process', (req, res) => {
-    try {
-      const batchSize = Number(req.body?.batchSize || 25);
-      const result = engine.processOutboxBatch(batchSize);
-      res.json({
-        ...result,
-        outbox: engine.listOutbox('ALL'),
-        history: engine.listSyncHistory(),
-        stats: engine.getStats(),
-      });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  // --- Settings, Persian Normalizer Lab, Backups & Milestone 0 Foundation ---
-  app.put('/api/settings', (req, res) => {
-    try {
-      const updates = (req.body || {}) as Record<string, string>;
-      const settings = engine.updateSettings(updates);
-      res.json({ settings, stats: engine.getStats() });
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-    }
-  });
-
-  app.post('/api/normalize-preview', (req, res) => {
-    const sampleText = String(req.body?.text || '');
-    const sampleQuery = String(req.body?.query || '');
-    const options = engine.getNormalizationOptions();
-    const normalized = normalizePersianText(sampleText, options);
-    const indexable = buildIndexableNormalizedText(sampleText, options);
-    const ftsFlexible = buildFtsQuery(sampleQuery, SearchMode.FLEXIBLE, options);
-    const ftsExact = buildFtsQuery(sampleQuery, SearchMode.EXACT, options);
-
-    res.json({
-      normalized,
-      indexable,
-      ftsFlexible,
-      ftsExact,
-    });
-  });
-
-  app.post('/api/maintenance/rebuild-fts', (_req, res) => {
-    try {
-      const result = engine.rebuildFtsIndex();
-      res.json({ ...result, stats: engine.getStats(), integrity: engine.checkIntegrity() });
-    } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
-    }
-  });
-
-  app.get('/api/maintenance/backups', (_req, res) => {
-    res.json({
-      backups: engine.listBackups(),
-      integrity: engine.checkIntegrity(),
-    });
-  });
-
-  app.post('/api/maintenance/backups', (_req, res) => {
-    try {
-      const backup = engine.createAtomicBackup();
-      res.json({
-        backup,
-        backups: engine.listBackups(),
-        stats: engine.getStats(),
+        milestone: 'Milestone 0 — Project Foundation',
+        pythonVersionPin,
+        pyprojectToml,
+        schemaSql,
+        pythonStatus,
+        docs,
       });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
 
-  app.get('/api/foundation/files', (_req, res) => {
-    const readSafe = (relPath: string) => {
-      const full = path.resolve(process.cwd(), relPath);
-      return fs.existsSync(full) ? fs.readFileSync(full, 'utf-8') : '';
-    };
+  app.post('/api/foundation/init', async (_req, res) => {
+    const uvBin = resolveUvBinary();
+    const runResult = await runCommandCapture(
+      uvBin,
+      ['run', '--no-sync', 'python', '-m', 'app.main'],
+      20000
+    );
+    const pythonStatus = await inspectPythonHealth();
     res.json({
-      files: [
-        {
-          name: 'pyproject.toml',
-          path: 'pyproject.toml',
-          language: 'toml',
-          description: 'پیکربندی محیط Python 3.13/3.14، وابستگی‌های Telethon، FastAPI، Pydantic، pytest و Ruff',
-          content: readSafe('pyproject.toml'),
-        },
-        {
-          name: 'collector/telegram_collector.py',
-          path: 'collector/telegram_collector.py',
-          language: 'python',
-          description: 'ماژول دریافت تاریخچه متنی تلگرام (Telethon Async) با مدیریت Checkpoint، FloodWait و بدون دانلود رسانه',
-          content: readSafe('collector/telegram_collector.py'),
-        },
-        {
-          name: 'ARCHITECTURE.md',
-          path: 'ARCHITECTURE.md',
-          language: 'markdown',
-          description: 'مستند معماری چهارلایه، طرحواره SQLite + FTS5 و مرزهای امنیتی پروژه',
-          content: readSafe('ARCHITECTURE.md'),
-        },
-        {
-          name: 'ROADMAP.md',
-          path: 'ROADMAP.md',
-          language: 'markdown',
-          description: 'نقشه راه اجرایی از Milestone 0 تا نسخه پایدار 1.0 و معیارهای پذیرش هر فاز',
-          content: readSafe('ROADMAP.md'),
-        },
-      ],
+      ...runResult,
+      pythonStatus,
     });
   });
 
-  // --- Vite Middleware (Dev) or Static Dist (Prod) ---
+  app.post('/api/foundation/verify', async (_req, res) => {
+    const uvBin = resolveUvBinary();
+    const pytestRes = await runCommandCapture(uvBin, ['run', '--no-sync', 'pytest', '-v'], 30000);
+    const ruffRes = await runCommandCapture(uvBin, ['run', '--no-sync', 'ruff', 'check', '.'], 15000);
+    res.json({
+      pytest: pytestRes,
+      ruff: ruffRes,
+    });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -395,7 +167,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(ROOT_DIR, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -403,7 +175,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Telegram Knowledge Engine running on http://0.0.0.0:${PORT}`);
+    console.log(`TKE Milestone 0 Foundation host listening on http://0.0.0.0:${PORT}`);
   });
 }
 
