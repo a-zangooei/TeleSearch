@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Knowledge Engine",
+  "description": "موتور دانش شخصی و پلتفرم محلی آرشیو، نرمالسازی فارسی و جستوجوی متنی پیامهای تلگرام مبتنی بر SQLite و FTS5",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
